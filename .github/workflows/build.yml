@@ -1,0 +1,368 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Generate project files
+        run: |
+          mkdir -p app/src/main/java/com/example/ordercopy
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "OrderCopy"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.example.ordercopy'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.example.ordercopy'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          dependencies {
+              implementation 'androidx.documentfile:documentfile:1.0.1'
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="نسخ مرتب"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/ordercopy/MainActivity.java <<'EOF'
+          package com.example.ordercopy;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.CheckBox;
+          import android.widget.LinearLayout;
+          import android.widget.ProgressBar;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import androidx.documentfile.provider.DocumentFile;
+
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+
+              static class Item {
+                  String name;
+                  DocumentFile file;
+                  boolean dir;
+              }
+
+              private Uri srcUri, dstUri;
+              private TextView tvSrc, tvDst, tvStatus, tvLog;
+              private ProgressBar bar;
+              private CheckBox cbFlat;
+              private Button btnStart;
+              private volatile boolean cancelled = false;
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private int total, done, skipped, failed;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  int pad = (int) (16 * getResources().getDisplayMetrics().density);
+
+                  ScrollView sv = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(pad, pad, pad, pad);
+                  sv.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("نسخ الملفات بترتيب الأسماء");
+                  title.setTextSize(22);
+                  root.addView(title);
+
+                  TextView hint = new TextView(this);
+                  hint.setText("يُفضّل أن يكون الكارت مُهيّأً حديثاً (FAT32) وفارغاً، حتى يطابق ترتيب القراءة ترتيب النسخ.");
+                  hint.setPadding(0, pad / 2, 0, pad / 2);
+                  root.addView(hint);
+
+                  root.addView(makeButton("1) اختر مجلد الملفات (المصدر)", v -> pick(1)));
+                  tvSrc = new TextView(this);
+                  tvSrc.setText("لم يتم الاختيار");
+                  root.addView(tvSrc);
+
+                  root.addView(makeButton("2) اختر الكارت أو المجلد الهدف", v -> pick(2)));
+                  tvDst = new TextView(this);
+                  tvDst.setText("لم يتم الاختيار");
+                  root.addView(tvDst);
+
+                  cbFlat = new CheckBox(this);
+                  cbFlat.setText("ضع كل الملفات في مكان واحد بدون مجلدات");
+                  root.addView(cbFlat);
+
+                  btnStart = makeButton("3) ابدأ النسخ", v -> start());
+                  root.addView(btnStart);
+                  root.addView(makeButton("إيقاف", v -> cancelled = true));
+
+                  bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  root.addView(bar);
+
+                  tvStatus = new TextView(this);
+                  root.addView(tvStatus);
+
+                  tvLog = new TextView(this);
+                  root.addView(tvLog);
+
+                  setContentView(sv);
+              }
+
+              private Button makeButton(String text, View.OnClickListener l) {
+                  Button bt = new Button(this);
+                  bt.setText(text);
+                  bt.setOnClickListener(l);
+                  return bt;
+              }
+
+              private void pick(int code) {
+                  startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), code);
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (res != RESULT_OK || data == null || data.getData() == null) return;
+                  Uri u = data.getData();
+                  DocumentFile f = DocumentFile.fromTreeUri(this, u);
+                  String name = (f != null && f.getName() != null) ? f.getName() : u.toString();
+                  if (req == 1) {
+                      srcUri = u;
+                      tvSrc.setText("المصدر: " + name);
+                  } else {
+                      dstUri = u;
+                      tvDst.setText("الهدف: " + name);
+                  }
+              }
+
+              private void start() {
+                  if (srcUri == null || dstUri == null) {
+                      Toast.makeText(this, "اختر المصدر والهدف أولاً", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  if (srcUri.equals(dstUri)) {
+                      Toast.makeText(this, "المصدر والهدف متطابقان", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  cancelled = false;
+                  btnStart.setEnabled(false);
+                  tvLog.setText("");
+                  final boolean flat = cbFlat.isChecked();
+                  new Thread(() -> {
+                      try {
+                          DocumentFile s = DocumentFile.fromTreeUri(this, srcUri);
+                          DocumentFile d = DocumentFile.fromTreeUri(this, dstUri);
+                          total = count(s);
+                          done = 0;
+                          skipped = 0;
+                          failed = 0;
+                          ui.post(() -> {
+                              bar.setMax(Math.max(total, 1));
+                              bar.setProgress(0);
+                              tvStatus.setText("عدد الملفات: " + total);
+                          });
+                          copyTree(s, d, flat);
+                          final String end = cancelled ? "تم الإيقاف" : "اكتمل";
+                          ui.post(() -> tvStatus.setText(end + " — نُسخ " + done + " | تُخطّي " + skipped + " | فشل " + failed));
+                      } catch (Exception e) {
+                          ui.post(() -> tvStatus.setText("خطأ: " + e.getMessage()));
+                      } finally {
+                          ui.post(() -> btnStart.setEnabled(true));
+                      }
+                  }).start();
+              }
+
+              private List<Item> list(DocumentFile dir) {
+                  List<Item> out = new ArrayList<>();
+                  DocumentFile[] arr = dir.listFiles();
+                  for (DocumentFile f : arr) {
+                      String n = f.getName();
+                      if (n == null) continue;
+                      Item it = new Item();
+                      it.name = n;
+                      it.file = f;
+                      it.dir = f.isDirectory();
+                      out.add(it);
+                  }
+                  Collections.sort(out, (a, c) -> natural(a.name, c.name));
+                  return out;
+              }
+
+              private int count(DocumentFile dir) {
+                  int n = 0;
+                  for (Item it : list(dir)) {
+                      if (it.dir) n += count(it.file);
+                      else n++;
+                  }
+                  return n;
+              }
+
+              private void copyTree(DocumentFile src, DocumentFile dst, boolean flat) throws IOException {
+                  List<Item> items = list(src);
+                  for (Item it : items) {
+                      if (cancelled) return;
+                      if (!it.dir) copyOne(it, dst);
+                  }
+                  for (Item it : items) {
+                      if (cancelled) return;
+                      if (it.dir) {
+                          DocumentFile target = dst;
+                          if (!flat) {
+                              target = dst.findFile(it.name);
+                              if (target == null) target = dst.createDirectory(it.name);
+                              if (target == null) throw new IOException("تعذّر إنشاء المجلد " + it.name);
+                          }
+                          copyTree(it.file, target, flat);
+                      }
+                  }
+              }
+
+              private void copyOne(Item it, DocumentFile dst) {
+                  try {
+                      if (dst.findFile(it.name) != null) {
+                          skipped++;
+                          log("تُخطّي (موجود): " + it.name);
+                          return;
+                      }
+                      String mime = it.file.getType();
+                      if (mime == null) mime = "application/octet-stream";
+                      DocumentFile out = dst.createFile(mime, it.name);
+                      if (out == null) throw new IOException("تعذّر إنشاء الملف");
+                      try (InputStream in = getContentResolver().openInputStream(it.file.getUri());
+                           OutputStream os = getContentResolver().openOutputStream(out.getUri())) {
+                          if (in == null || os == null) throw new IOException("تعذّر فتح الملف");
+                          byte[] buf = new byte[65536];
+                          int r;
+                          while ((r = in.read(buf)) > 0) os.write(buf, 0, r);
+                          os.flush();
+                      }
+                      done++;
+                  } catch (Exception e) {
+                      failed++;
+                      log("فشل: " + it.name + " — " + e.getMessage());
+                  }
+                  final String nm = it.name;
+                  ui.post(() -> {
+                      bar.setProgress(done + skipped + failed);
+                      tvStatus.setText("نُسخ " + done + " من " + total + " — " + nm);
+                  });
+              }
+
+              private void log(String s) {
+                  ui.post(() -> tvLog.append(s + "\n"));
+              }
+
+              static int natural(String a, String b) {
+                  int i = 0, j = 0;
+                  while (i < a.length() && j < b.length()) {
+                      char x = a.charAt(i), y = b.charAt(j);
+                      if (Character.isDigit(x) && Character.isDigit(y)) {
+                          int si = i, sj = j;
+                          while (i < a.length() && Character.isDigit(a.charAt(i))) i++;
+                          while (j < b.length() && Character.isDigit(b.charAt(j))) j++;
+                          String na = a.substring(si, i).replaceFirst("^0+(?!$)", "");
+                          String nb = b.substring(sj, j).replaceFirst("^0+(?!$)", "");
+                          if (na.length() != nb.length()) return na.length() - nb.length();
+                          int c = na.compareTo(nb);
+                          if (c != 0) return c;
+                      } else {
+                          char lx = Character.toLowerCase(x), ly = Character.toLowerCase(y);
+                          if (lx != ly) return lx - ly;
+                          i++;
+                          j++;
+                      }
+                  }
+                  return (a.length() - i) - (b.length() - j);
+              }
+          }
+          EOF
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OrderCopy-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
