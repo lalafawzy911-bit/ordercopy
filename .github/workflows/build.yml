@@ -57,8 +57,8 @@ jobs:
                   applicationId 'com.example.ordercopy'
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '1.1'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -85,6 +85,9 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+                  <activity
+                      android:name=".ReorderActivity"
+                      android:exported="false" />
               </application>
           </manifest>
           EOF
@@ -150,6 +153,9 @@ jobs:
                   title.setText("نسخ الملفات بترتيب الأسماء");
                   title.setTextSize(22);
                   root.addView(title);
+
+                  root.addView(makeButton("وضع جديد: إعادة ترتيب الكارت في مكانه (بدون نسخ)",
+                          v -> startActivity(new Intent(this, ReorderActivity.class))));
 
                   TextView hint = new TextView(this);
                   hint.setText("يُفضّل أن يكون الكارت مُهيّأً حديثاً (FAT32) وفارغاً، حتى يطابق ترتيب القراءة ترتيب النسخ.");
@@ -351,6 +357,327 @@ jobs:
                       }
                   }
                   return (a.length() - i) - (b.length() - j);
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/ordercopy/ReorderActivity.java <<'EOF'
+          package com.example.ordercopy;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.DocumentsContract;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ProgressBar;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import androidx.documentfile.provider.DocumentFile;
+
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.List;
+
+          public class ReorderActivity extends Activity {
+
+              private static final String TMP = "_ordertmp";
+
+              private Uri rootUri;
+              private TextView tvRoot, tvStatus, tvLog;
+              private ProgressBar bar;
+              private Button btnStart;
+              private volatile boolean cancelled = false;
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private int dirsTotal, filesTotal, dirsDone, failures, dirsOrdered;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  int pad = (int) (16 * getResources().getDisplayMetrics().density);
+
+                  ScrollView sv = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(pad, pad, pad, pad);
+                  sv.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("إعادة ترتيب الكارت في مكانه");
+                  title.setTextSize(22);
+                  root.addView(title);
+
+                  TextView hint = new TextView(this);
+                  hint.setText("لكل مجلد: تُنقل ملفاته ومجلداته الفرعية بالترتيب الرقمي إلى مجلد مؤقت داخل المجلد نفسه، ثم تُعاد بنفس الترتيب. لا نسخ ولا مساحة إضافية ولا تتغير الأسماء. الملفات أولاً ثم المجلدات. جرّب أولاً على مجلد صغير.");
+                  hint.setPadding(0, pad / 2, 0, pad / 2);
+                  root.addView(hint);
+
+                  root.addView(makeButton("1) اختر الكارت أو المجلد", v -> pick()));
+                  tvRoot = new TextView(this);
+                  tvRoot.setText("لم يتم الاختيار");
+                  root.addView(tvRoot);
+
+                  root.addView(makeButton("2) فحص ومعاينة", v -> scan()));
+
+                  btnStart = makeButton("3) ابدأ إعادة الترتيب", v -> start());
+                  btnStart.setEnabled(false);
+                  root.addView(btnStart);
+
+                  root.addView(makeButton("إيقاف", v -> cancelled = true));
+
+                  bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  root.addView(bar);
+
+                  tvStatus = new TextView(this);
+                  root.addView(tvStatus);
+
+                  tvLog = new TextView(this);
+                  root.addView(tvLog);
+
+                  setContentView(sv);
+              }
+
+              private Button makeButton(String text, View.OnClickListener l) {
+                  Button bt = new Button(this);
+                  bt.setText(text);
+                  bt.setOnClickListener(l);
+                  return bt;
+              }
+
+              private void pick() {
+                  startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), 1);
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (res != RESULT_OK || data == null || data.getData() == null) return;
+                  rootUri = data.getData();
+                  DocumentFile f = DocumentFile.fromTreeUri(this, rootUri);
+                  String name = (f != null && f.getName() != null) ? f.getName() : rootUri.toString();
+                  tvRoot.setText("المختار: " + name);
+                  btnStart.setEnabled(false);
+              }
+
+              private static boolean skip(String n) {
+                  String l = n.toLowerCase();
+                  return n.startsWith(".") || n.equals(TMP) || l.equals("android")
+                          || l.equals("lost.dir") || l.equals("system volume information")
+                          || l.equals("$recycle.bin");
+              }
+
+              // الملفات أولاً بالترتيب الرقمي، ثم المجلدات بالترتيب الرقمي
+              private List<MainActivity.Item> order(DocumentFile dir) {
+                  List<MainActivity.Item> files = new ArrayList<>();
+                  List<MainActivity.Item> dirs = new ArrayList<>();
+                  for (DocumentFile f : dir.listFiles()) {
+                      String n = f.getName();
+                      if (n == null || skip(n)) continue;
+                      MainActivity.Item it = new MainActivity.Item();
+                      it.name = n;
+                      it.file = f;
+                      it.dir = f.isDirectory();
+                      if (it.dir) dirs.add(it);
+                      else files.add(it);
+                  }
+                  Collections.sort(files, (a, c) -> MainActivity.natural(a.name, c.name));
+                  Collections.sort(dirs, (a, c) -> MainActivity.natural(a.name, c.name));
+                  files.addAll(dirs);
+                  return files;
+              }
+
+              private void scanDir(DocumentFile dir) {
+                  for (MainActivity.Item it : order(dir)) {
+                      if (it.dir) {
+                          dirsTotal++;
+                          scanDir(it.file);
+                      } else {
+                          filesTotal++;
+                      }
+                  }
+              }
+
+              private void scan() {
+                  if (rootUri == null) {
+                      Toast.makeText(this, "اختر الكارت أولاً", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  tvLog.setText("");
+                  tvStatus.setText("جارٍ الفحص...");
+                  new Thread(() -> {
+                      try {
+                          DocumentFile r = DocumentFile.fromTreeUri(this, rootUri);
+                          dirsTotal = 1;
+                          filesTotal = 0;
+                          scanDir(r);
+                          List<MainActivity.Item> top = order(r);
+                          StringBuilder sb = new StringBuilder("الترتيب الذي سيُطبَّق في المجلد الرئيسي:\n");
+                          int n = Math.min(top.size(), 40);
+                          for (int i = 0; i < n; i++) {
+                              sb.append(i + 1).append(". ");
+                              if (top.get(i).dir) sb.append("[مجلد] ");
+                              sb.append(top.get(i).name).append("\n");
+                          }
+                          if (top.size() > n) sb.append("... و").append(top.size() - n).append(" أخرى\n");
+                          final String preview = sb.toString();
+                          final String st = "مجلدات: " + dirsTotal + " | ملفات: " + filesTotal;
+                          ui.post(() -> {
+                              tvStatus.setText(st);
+                              tvLog.setText(preview);
+                              btnStart.setEnabled(true);
+                          });
+                      } catch (Exception e) {
+                          ui.post(() -> tvStatus.setText("خطأ: " + e.getMessage()));
+                      }
+                  }).start();
+              }
+
+              private void start() {
+                  cancelled = false;
+                  btnStart.setEnabled(false);
+                  tvLog.setText("");
+                  dirsDone = 0;
+                  failures = 0;
+                  dirsOrdered = 0;
+                  ui.post(() -> {
+                      bar.setMax(Math.max(dirsTotal, 1));
+                      bar.setProgress(0);
+                  });
+                  new Thread(() -> {
+                      try {
+                          DocumentFile r = DocumentFile.fromTreeUri(this, rootUri);
+                          processDir(r, "/");
+                          final String end = cancelled ? "تم الإيقاف" : "اكتمل";
+                          final String msg = end + " — مجلدات: " + dirsDone + " | مرتبة حسب ما يعرضه النظام: "
+                                  + dirsOrdered + " | أخطاء: " + failures;
+                          ui.post(() -> tvStatus.setText(msg));
+                      } catch (Exception e) {
+                          ui.post(() -> tvStatus.setText("خطأ: " + e.getMessage()));
+                      } finally {
+                          ui.post(() -> btnStart.setEnabled(true));
+                      }
+                  }).start();
+              }
+
+              private Uri treeUri(Uri moved, String fallbackId) {
+                  String id = (moved != null) ? DocumentsContract.getDocumentId(moved) : fallbackId;
+                  return DocumentsContract.buildDocumentUriUsingTree(rootUri, id);
+              }
+
+              // إن بقيت ملفات في المجلد المؤقت من تشغيل سابق متوقف، تُعاد أولاً
+              private void restoreTemp(DocumentFile dir, DocumentFile temp) {
+                  List<MainActivity.Item> kids = new ArrayList<>();
+                  for (DocumentFile f : temp.listFiles()) {
+                      String n = f.getName();
+                      if (n == null) continue;
+                      MainActivity.Item it = new MainActivity.Item();
+                      it.name = n;
+                      it.file = f;
+                      kids.add(it);
+                  }
+                  Collections.sort(kids, (a, c) -> MainActivity.natural(a.name, c.name));
+                  for (MainActivity.Item it : kids) {
+                      try {
+                          DocumentsContract.moveDocument(getContentResolver(), it.file.getUri(), temp.getUri(), dir.getUri());
+                      } catch (Exception e) {
+                          failures++;
+                          log("تعذّرت إعادة " + it.name + " — " + e.getMessage());
+                      }
+                  }
+                  if (temp.listFiles().length == 0) temp.delete();
+              }
+
+              private void processDir(DocumentFile dir, String path) {
+                  if (cancelled) return;
+
+                  DocumentFile old = dir.findFile(TMP);
+                  if (old != null && old.isDirectory()) restoreTemp(dir, old);
+
+                  List<MainActivity.Item> items = order(dir);
+
+                  for (MainActivity.Item it : items) {
+                      if (it.dir) {
+                          processDir(it.file, path + it.name + "/");
+                          if (cancelled) return;
+                      }
+                  }
+
+                  dirsDone++;
+                  final int d = dirsDone;
+                  final String p = path;
+                  ui.post(() -> {
+                      bar.setProgress(d);
+                      tvStatus.setText("المجلد " + d + " من " + dirsTotal + " — " + p);
+                  });
+
+                  if (items.size() < 2) {
+                      dirsOrdered++;
+                      return;
+                  }
+
+                  DocumentFile temp = dir.createDirectory(TMP);
+                  if (temp == null) {
+                      failures++;
+                      log("تعذّر إنشاء مجلد مؤقت في " + path);
+                      return;
+                  }
+                  Uri dirUri = dir.getUri();
+                  Uri tmpUri = temp.getUri();
+                  String tmpId = DocumentsContract.getDocumentId(tmpUri);
+
+                  List<Uri> moved = new ArrayList<>();
+                  for (MainActivity.Item it : items) {
+                      if (cancelled) break;
+                      try {
+                          Uri nu = DocumentsContract.moveDocument(getContentResolver(), it.file.getUri(), dirUri, tmpUri);
+                          moved.add(treeUri(nu, tmpId + "/" + it.name));
+                      } catch (Exception e) {
+                          failures++;
+                          log("تعذّر نقل " + it.name + " في " + path + " — " + e.getMessage());
+                          break;
+                      }
+                  }
+
+                  for (Uri u : moved) {
+                      try {
+                          DocumentsContract.moveDocument(getContentResolver(), u, tmpUri, dirUri);
+                      } catch (Exception e) {
+                          failures++;
+                          log("تعذّرت الإعادة في " + path + " — " + e.getMessage() + " (أعد التشغيل لإكمالها)");
+                      }
+                  }
+
+                  if (temp.listFiles().length == 0) {
+                      temp.delete();
+                  } else {
+                      log("بقيت ملفات في " + TMP + " داخل " + path + " — أعد التشغيل لإكمالها");
+                  }
+
+                  List<String> expected = new ArrayList<>();
+                  for (MainActivity.Item it : items) expected.add(it.name);
+                  List<String> actual = new ArrayList<>();
+                  for (DocumentFile f : dir.listFiles()) {
+                      String n = f.getName();
+                      if (n == null || skip(n)) continue;
+                      actual.add(n);
+                  }
+                  if (expected.equals(actual)) {
+                      dirsOrdered++;
+                  } else {
+                      log("الترتيب الظاهر مختلف في " + path);
+                  }
+              }
+
+              private void log(String s) {
+                  ui.post(() -> tvLog.append(s + "\n"));
               }
           }
           EOF
